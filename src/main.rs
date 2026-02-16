@@ -1,36 +1,9 @@
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use std::sync::mpsc::{RecvTimeoutError};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-
-    std::thread::spawn(move || {
-        activity_thread_main(receiver)
-    });
-
-    let listen_callback = move |event: rdev::Event| {
-        use rdev::EventType;
-
-        match event.event_type {
-            EventType::MouseMove {..} => {
-                // If there's an error, we assume we won't be called again.
-                if let Err(_) = sender.send(()) {
-                    std::process::exit(1);
-                }
-            }
-            _ => (),
-        }
-    };
-
-    // This will call callback endlessly.
-    rdev::listen(listen_callback).map_err(|e| format!("Error: {e:?}").into())
-}
-
-fn activity_thread_main(receiver: std::sync::mpsc::Receiver<()>) {
-    use std::path::PathBuf;
-    use std::process::Command;
-
-    let flags = xflags::parse_or_exit! {
+xflags::xflags! {
+    cmd on-mouse {
         /// Exectuable to run when mouse is detected to be actively moved
         optional --on-active on_active: PathBuf
         /// Exectuable to run when mouse is detected to be not actively moved
@@ -42,7 +15,108 @@ fn activity_thread_main(receiver: std::sync::mpsc::Receiver<()>) {
         /// The minimum gap between two readings to consider the mouse inactive, in milliseconds.
         /// Defaults to one second.
         optional --min-movement-gap min_movement_gap: u64
-    };
+        /// The name of a device to grap and thus block any other applications from seeing.
+        /// The passed name indicates which device to grab. If passed, any other mice will be 
+        /// ignored by this program.
+        /// On Linux, the name for a given device can be found using the `evdev` application.
+        /// Currently not supported on Windows.
+        // Making the grabbing work on windows seems extremely complciated and fiddly.
+        // No crate or simple working example that specifically eats the input was
+        // from the grabbed device was found. Apparently what one neesd to do is set
+        // a low-level mouse hook, via SetWindowsHookEx and conditionally call or not
+        // call CallNextHookEx in the handler, to pass on or not pass on the input.
+        // That's fine enough, but the closest thing to an example like that which I
+        // was able to find acted strangely and incorrectly when run, in a way that
+        // makes me suspect undefined behaviour. Miri is no help here, because it 
+        // doesn't support calling things like SetWindowsHookEx.
+        optional --grab-device grab_device: String
+    }
+}
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let flags = OnMouse::from_env_or_exit();
+
+    match flags.grab_device.clone() {
+        None => {
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                activity_thread_main(receiver, flags)
+            });
+
+            let listen_callback = move |event: rdev::Event| {
+                use rdev::EventType;
+        
+                match event.event_type {
+                    EventType::MouseMove {..} => {
+                        // If there's an error, we assume we won't be called again.
+                        if let Err(_) = sender.send(()) {
+                            std::process::exit(1);
+                        }
+                    }
+                    _ => (),
+                }
+            };
+        
+            // This will call callback endlessly.
+            rdev::listen(listen_callback).map_err(|e| format!("Error: {e:?}").into())
+        },
+        Some(target_device_name) => {
+            // TODO? Use evdev-rs instead of evdev since rdev uses evdev-rs?
+
+            // Capture the target mouse.
+            let devices = evdev::enumerate();
+        
+            let mut device_opt = None;
+        
+            for (_, device) in devices {
+                if device.name() == Some(&target_device_name) {
+                    device_opt = Some(device);
+        
+                    break
+                }
+            }
+        
+            if let Some(mut device) = device_opt {
+                device.grab()?;
+        
+                println!("Grabbed device");
+        
+                let (sender, receiver) = std::sync::mpsc::channel();
+        
+                std::thread::spawn(move || {
+                    activity_thread_main(receiver, flags)
+                });
+        
+                // Monitor the target mouse's events, sending signals to other thread in response.
+                loop {
+                    use evdev::{EventType, RelativeAxisCode};
+        
+                    match device.fetch_events() {
+                        Ok(iter) => {
+                            for event in iter {
+                                if event.event_type() == EventType::RELATIVE 
+                                && RelativeAxisCode(event.code()) == RelativeAxisCode::REL_Y { 
+                                    // If there's an error, we assume we won't be called again.
+                                    if let Err(_) = sender.send(()) {
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                        }        
+                        Err(e) => { dbg!(e); }
+                    }
+                }
+            } else {
+                Err(format!("No device named \"{target_device_name}\" found. Elevated priveldges are needed to access some devices. Consider running with `sudo`").into())
+            }
+        }
+    }
+}
+
+fn activity_thread_main(receiver: std::sync::mpsc::Receiver<()>, flags: OnMouse) {
+    use std::process::Command;
 
     let on_activity = {
         let on_active = flags.on_active;

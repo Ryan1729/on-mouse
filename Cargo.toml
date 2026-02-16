@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+evdev = "0.13.2"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 rdev = "0.5.3"
 xflags = "0.3.2"
