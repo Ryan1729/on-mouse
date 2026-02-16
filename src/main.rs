@@ -5,16 +5,16 @@ use std::sync::mpsc::{RecvTimeoutError};
 xflags::xflags! {
     cmd on-mouse {
         /// Exectuable to run when mouse is detected to be actively moved
-        optional --on-active on_active: PathBuf
+        optional --on-active path: PathBuf
         /// Exectuable to run when mouse is detected to be not actively moved
-        optional --on-inactive on_inactive: PathBuf
+        optional --on-inactive path: PathBuf
         /// Whether to supress output of the current state
         optional -q,--quiet
         /// Whether to display a chart instead of default, basic print output of the current state
         optional --chart
         /// The minimum gap between two readings to consider the mouse inactive, in milliseconds.
         /// Defaults to one second.
-        optional --min-movement-gap min_movement_gap: u64
+        optional --min-movement-gap milliseconds: u64
         /// The name of a device to grap and thus block any other applications from seeing.
         /// The passed name indicates which device to grab. If passed, any other mice will be 
         /// ignored by this program.
@@ -29,13 +29,21 @@ xflags::xflags! {
         // was able to find acted strangely and incorrectly when run, in a way that
         // makes me suspect undefined behaviour. Miri is no help here, because it 
         // doesn't support calling things like SetWindowsHookEx.
-        optional --grab-device grab_device: String
+        optional --grab-device device_name: String
+        /// Output the version and exit
+        optional --version
     }
 }
 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags = OnMouse::from_env_or_exit();
+
+    if flags.version {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+
+        return Ok(());
+    }
 
     match flags.grab_device.clone() {
         None => {
@@ -63,53 +71,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rdev::listen(listen_callback).map_err(|e| format!("Error: {e:?}").into())
         },
         Some(target_device_name) => {
-            // TODO? Use evdev-rs instead of evdev since rdev uses evdev-rs?
-
-            // Capture the target mouse.
-            let devices = evdev::enumerate();
-        
-            let mut device_opt = None;
-        
-            for (_, device) in devices {
-                if device.name() == Some(&target_device_name) {
-                    device_opt = Some(device);
-        
-                    break
-                }
+            #[cfg(target_family = "windows")]
+            {
+                return Err(format!("Can't grab {target_device_name} because grabbing devices is not yet supported on Windows").into())
             }
-        
-            if let Some(mut device) = device_opt {
-                device.grab()?;
-        
-                println!("Grabbed device");
-        
-                let (sender, receiver) = std::sync::mpsc::channel();
-        
-                std::thread::spawn(move || {
-                    activity_thread_main(receiver, flags)
-                });
-        
-                // Monitor the target mouse's events, sending signals to other thread in response.
-                loop {
-                    use evdev::{EventType, RelativeAxisCode};
-        
-                    match device.fetch_events() {
-                        Ok(iter) => {
-                            for event in iter {
-                                if event.event_type() == EventType::RELATIVE 
-                                && RelativeAxisCode(event.code()) == RelativeAxisCode::REL_Y { 
-                                    // If there's an error, we assume we won't be called again.
-                                    if let Err(_) = sender.send(()) {
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                        }        
-                        Err(e) => { dbg!(e); }
+
+            #[cfg(not(target_family = "windows"))]
+            {
+                // TODO? Use evdev-rs instead of evdev since rdev uses evdev-rs?
+
+                // Capture the target mouse.
+                let devices = evdev::enumerate();
+            
+                let mut device_opt = None;
+            
+                for (_, device) in devices {
+                    if device.name() == Some(&target_device_name) {
+                        device_opt = Some(device);
+            
+                        break
                     }
                 }
-            } else {
-                Err(format!("No device named \"{target_device_name}\" found. Elevated priveldges are needed to access some devices. Consider running with `sudo`").into())
+            
+                if let Some(mut device) = device_opt {
+                    device.grab()?;
+            
+                    println!("Grabbed device");
+            
+                    let (sender, receiver) = std::sync::mpsc::channel();
+            
+                    std::thread::spawn(move || {
+                        activity_thread_main(receiver, flags)
+                    });
+            
+                    // Monitor the target mouse's events, sending signals to other thread in response.
+                    loop {
+                        use evdev::{EventType, RelativeAxisCode};
+            
+                        match device.fetch_events() {
+                            Ok(iter) => {
+                                for event in iter {
+                                    if event.event_type() == EventType::RELATIVE 
+                                    && RelativeAxisCode(event.code()) == RelativeAxisCode::REL_Y { 
+                                        // If there's an error, we assume we won't be called again.
+                                        if let Err(_) = sender.send(()) {
+                                            std::process::exit(1);
+                                        }
+                                    }
+                                }
+                            }        
+                            Err(e) => { dbg!(e); }
+                        }
+                    }
+                } else {
+                    Err(format!("No device named \"{target_device_name}\" found. Elevated priveldges are needed to access some devices. Consider running with `sudo`").into())
+                }
             }
         }
     }
